@@ -15,33 +15,14 @@
 
 import Foundation
 
-/// What can go wrong talking to the archive.
-public enum WaybackError: Error, LocalizedError, Sendable, Equatable {
-    /// The URL given could not be put into a request.
-    case badURL(String)
-    /// The archive answered with an HTTP failure.
-    case http(Int)
-    /// The archive is rate-limiting; retry after this many seconds if known.
-    case rateLimited(retryAfter: Int?)
-    /// A response did not have the shape the index documents.
-    case malformed(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .badURL(let url): return "\(url) is not a URL a request can be made from"
-        case .http(let code): return "the archive answered HTTP \(code)"
-        case .rateLimited(let after):
-            return "the archive is rate-limiting" + (after.map { " (retry after \($0)s)" } ?? "")
-        case .malformed(let what): return "unexpected response shape: \(what)"
-        }
-    }
-}
-
 /// A keyless client for the Wayback Machine.
 public struct Wayback: Sendable {
 
     /// How requests are performed — injectable so tests run on recordings.
     public typealias Transport = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
+
+    /// How a retry waits — injectable so rate-limit tests cost no wall-clock.
+    public typealias Sleeper = @Sendable (_ seconds: Int) async throws -> Void
 
     /// The User-Agent sent when none is chosen. No personal contact is
     /// baked in; override with something identifying your use.
@@ -51,6 +32,7 @@ public struct Wayback: Sendable {
     public let userAgent: String
 
     private let transport: Transport
+    private let sleeper: Sleeper
 
     /// A client.
     ///
@@ -58,8 +40,13 @@ public struct Wayback: Sendable {
     ///   - userAgent: Identify yourself; the archive's keyless endpoints
     ///     stay open because callers do.
     ///   - transport: Leave `nil` for the shared URLSession.
-    public init(userAgent: String = Wayback.defaultUserAgent, transport: Transport? = nil) {
+    ///   - sleeper: How a 429 retry waits; leave `nil` for real sleeping.
+    public init(userAgent: String = Wayback.defaultUserAgent, transport: Transport? = nil,
+                sleeper: Sleeper? = nil) {
         self.userAgent = userAgent
+        self.sleeper = sleeper ?? { seconds in
+            try await Task.sleep(nanoseconds: UInt64(max(seconds, 1)) * 1_000_000_000)
+        }
         self.transport = transport ?? { request in
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else {
@@ -87,25 +74,10 @@ public struct Wayback: Sendable {
     public func snapshots(of url: String, from: String? = nil, to: String? = nil,
                           limit: Int = 50, dedupe: Bool = true, onlyOK: Bool = true,
                           matchPrefix: Bool = false) async throws -> [Snapshot] {
-        var items = [
-            URLQueryItem(name: "url", value: url),
-            URLQueryItem(name: "output", value: "json"),
-            URLQueryItem(name: "limit", value: String(limit)),
-        ]
-        if matchPrefix {
-            items.append(URLQueryItem(name: "matchType", value: "prefix"))
-            items.append(URLQueryItem(name: "collapse", value: "urlkey"))
-        } else if dedupe {
-            items.append(URLQueryItem(name: "collapse", value: "digest"))
-        }
-        if onlyOK { items.append(URLQueryItem(name: "filter", value: "statuscode:200")) }
-        if let from { items.append(URLQueryItem(name: "from", value: from)) }
-        if let to { items.append(URLQueryItem(name: "to", value: to)) }
-        var components = URLComponents(string: "https://web.archive.org/cdx/search/cdx")!
-        components.queryItems = items
-        guard let endpoint = components.url else { throw WaybackError.badURL(url) }
+        let endpoint = try CDX.url(for: url, from: from, to: to, limit: limit,
+                                   dedupe: dedupe, onlyOK: onlyOK, matchPrefix: matchPrefix)
         let data = try await perform(endpoint)
-        return try Self.parseCDX(data)
+        return try CDX.parse(data)
     }
 
     /// The capture closest to `timestamp` — the latest at-or-before it,
@@ -155,7 +127,7 @@ public struct Wayback: Sendable {
     /// Asks the archive to capture `url` now. Honest expectations: this
     /// QUEUES a crawl; it does not wait for it.
     public func save(_ url: String) async throws -> SaveOutcome {
-        let target = url.hasPrefix("http") ? url : "https://\(url)"
+        let target = Target.normalized(url)
         guard let endpoint = URL(string: "https://web.archive.org/save/\(target)") else {
             throw WaybackError.badURL(url)
         }
@@ -205,39 +177,10 @@ public struct Wayback: Sendable {
         case 429:
             let after = response.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
             guard retriesLeft > 0 else { throw WaybackError.rateLimited(retryAfter: after) }
-            let wait = min(after ?? 1, 10)
-            try await Task.sleep(nanoseconds: UInt64(max(wait, 1)) * 1_000_000_000)
+            try await sleeper(min(after ?? 1, 10))
             return try await perform(url, retriesLeft: retriesLeft - 1)
         default:
             throw WaybackError.http(response.statusCode)
-        }
-    }
-
-    /// Parses the CDX JSON — an array of arrays whose FIRST row names the
-    /// columns. Parsing is by header name, never by position: the index's
-    /// column order is a documented default, not a promise.
-    static func parseCDX(_ data: Data) throws -> [Snapshot] {
-        guard let rows = try? JSONDecoder().decode([[String]].self, from: data) else {
-            throw WaybackError.malformed("CDX response is not an array of string arrays")
-        }
-        guard let header = rows.first else { return [] }
-        let index = Dictionary(uniqueKeysWithValues: header.enumerated().map { ($1, $0) })
-        func field(_ row: [String], _ name: String) -> String? {
-            guard let i = index[name], i < row.count else { return nil }
-            return row[i]
-        }
-        guard index["timestamp"] != nil, index["original"] != nil, index["digest"] != nil else {
-            throw WaybackError.malformed("CDX header is missing timestamp/original/digest: \(header)")
-        }
-        return rows.dropFirst().map { row in
-            let status = field(row, "statuscode").flatMap { $0 == "-" ? nil : Int($0) }
-            let length = field(row, "length").flatMap { $0 == "-" ? nil : Int($0) }
-            return Snapshot(timestamp: field(row, "timestamp") ?? "",
-                            original: field(row, "original") ?? "",
-                            mimeType: field(row, "mimetype") ?? "",
-                            statusCode: status,
-                            digest: field(row, "digest") ?? "",
-                            length: length)
         }
     }
 }

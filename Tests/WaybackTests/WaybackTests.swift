@@ -64,13 +64,13 @@ final class WaybackTests: XCTestCase {
     // MARK: Parsing
 
     func testCDXParsesByHeaderNamesNotPositions() throws {
-        let real = try Wayback.parseCDX(Data(Self.cdxReal.utf8))
+        let real = try CDX.parse(Data(Self.cdxReal.utf8))
         XCTAssertEqual(real.count, 2)
         XCTAssertEqual(real[0].timestamp, "20020120142510")
         XCTAssertEqual(real[0].statusCode, 200)
         XCTAssertEqual(real[0].length, 1792)
 
-        let shuffled = try Wayback.parseCDX(Data(Self.cdxShuffled.utf8))
+        let shuffled = try CDX.parse(Data(Self.cdxShuffled.utf8))
         XCTAssertEqual(shuffled[0].timestamp, "20020120142510", "column order must not matter")
         XCTAssertEqual(shuffled[0].original, "http://example.com:80/")
         XCTAssertEqual(shuffled[0].digest, "HT2DYGA5UKZCPBSFVCV3JOBXGW2G5UUA")
@@ -80,9 +80,9 @@ final class WaybackTests: XCTestCase {
     }
 
     func testMalformedAndEmptyCDX() throws {
-        XCTAssertThrowsError(try Wayback.parseCDX(Data("{\"not\": \"cdx\"}".utf8)))
-        XCTAssertThrowsError(try Wayback.parseCDX(Data("[[\"only\",\"nonsense\"]]".utf8)))
-        XCTAssertEqual(try Wayback.parseCDX(Data("[]".utf8)), [])
+        XCTAssertThrowsError(try CDX.parse(Data("{\"not\": \"cdx\"}".utf8)))
+        XCTAssertThrowsError(try CDX.parse(Data("[[\"only\",\"nonsense\"]]".utf8)))
+        XCTAssertEqual(try CDX.parse(Data("[]".utf8)), [])
     }
 
     func testSnapshotURLFormsAndDate() {

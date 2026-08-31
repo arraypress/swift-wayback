@@ -42,7 +42,7 @@ public struct Snapshot: Codable, Sendable, Equatable {
 
     /// The capture instant, parsed from ``timestamp`` (UTC).
     public var date: Date? {
-        Self.stamp.date(from: timestamp)
+        WaybackTimestamp.date(from: timestamp)
     }
 
     /// The replay page a person reads — with the archive's toolbar.
@@ -55,12 +55,4 @@ public struct Snapshot: Codable, Sendable, Equatable {
     public var originalBytesURL: URL {
         URL(string: "https://web.archive.org/web/\(timestamp)id_/\(original)")!
     }
-
-    private static let stamp: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyyMMddHHmmss"
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
 }
