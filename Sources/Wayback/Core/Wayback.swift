@@ -31,8 +31,8 @@ public struct Wayback: Sendable {
     /// The User-Agent every request carries.
     public let userAgent: String
 
-    private let transport: Transport
-    private let sleeper: Sleeper
+    /// User-Agent, transport and 429 policy, shared with ``InternetArchive``.
+    let session: ArchiveSession
 
     /// A client.
     ///
@@ -44,16 +44,7 @@ public struct Wayback: Sendable {
     public init(userAgent: String = Wayback.defaultUserAgent, transport: Transport? = nil,
                 sleeper: Sleeper? = nil) {
         self.userAgent = userAgent
-        self.sleeper = sleeper ?? { seconds in
-            try await Task.sleep(nanoseconds: UInt64(max(seconds, 1)) * 1_000_000_000)
-        }
-        self.transport = transport ?? { request in
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw WaybackError.malformed("not an HTTP response")
-            }
-            return (data, http)
-        }
+        self.session = ArchiveSession(userAgent: userAgent, transport: transport, sleeper: sleeper)
     }
 
     // MARK: - CDX index
@@ -131,9 +122,7 @@ public struct Wayback: Sendable {
         guard let endpoint = URL(string: "https://web.archive.org/save/\(target)") else {
             throw WaybackError.badURL(url)
         }
-        var request = URLRequest(url: endpoint)
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        let (_, response) = try await transport(request)
+        let (_, response) = try await session.send(URLRequest(url: endpoint))
         let location = response.value(forHTTPHeaderField: "Content-Location")
             ?? response.value(forHTTPHeaderField: "Location")
         return SaveOutcome(submitted: (200...399).contains(response.statusCode),
@@ -167,20 +156,7 @@ public struct Wayback: Sendable {
 
     /// Performs a GET with the User-Agent, retrying a 429 twice with the
     /// archive's own Retry-After (capped at ten seconds) before giving up.
-    func perform(_ url: URL, retriesLeft: Int = 2) async throws -> Data {
-        var request = URLRequest(url: url)
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await transport(request)
-        switch response.statusCode {
-        case 200...299:
-            return data
-        case 429:
-            let after = response.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
-            guard retriesLeft > 0 else { throw WaybackError.rateLimited(retryAfter: after) }
-            try await sleeper(min(after ?? 1, 10))
-            return try await perform(url, retriesLeft: retriesLeft - 1)
-        default:
-            throw WaybackError.http(response.statusCode)
-        }
+    func perform(_ url: URL) async throws -> Data {
+        try await session.perform(url)
     }
 }
